@@ -48,15 +48,30 @@ TELEMETRY_WILDCARD = "jowoiot/toServer/v2/+"   # device-fixed namespace
 # Confirmed from a capture: pa1/pb1 = live per-string power (W),
 # p1 = AC voltage, p2 = grid frequency (/100), g5 = DC voltage (/100).
 SENSORS = {
-    "pa1": ("pv1_power",  "PV1 Power",      1.0,  "W",  "power"),
-    "pb1": ("pv2_power",  "PV2 Power",      1.0,  "W",  "power"),
-    "pc1": ("pv3_power",  "PV3 Power",      1.0,  "W",  "power"),
-    "pd1": ("pv4_power",  "PV4 Power",      1.0,  "W",  "power"),
-    "p1":  ("ac_voltage", "AC Voltage",     1.0,  "V",  "voltage"),
-    "p2":  ("frequency",  "Grid Frequency", 0.01, "Hz", "frequency"),
-    "g5":  ("dc_voltage", "DC Voltage",     0.01, "V",  "voltage"),
+    "pa1": ("pv1_power",   "PV1 Power",      1.0,  "W",  "power"),
+    "pb1": ("pv2_power",   "PV2 Power",      1.0,  "W",  "power"),
+    "pc1": ("pv3_power",   "PV3 Power",      1.0,  "W",  "power"),
+    "pd1": ("pv4_power",   "PV4 Power",      1.0,  "W",  "power"),
+    "pa2": ("pv1_voltage", "PV1 Voltage",    0.5,  "V",  "voltage"),
+    "pb2": ("pv2_voltage", "PV2 Voltage",    0.5,  "V",  "voltage"),
+    "pc2": ("pv3_voltage", "PV3 Voltage",    0.5,  "V",  "voltage"),
+    "pd2": ("pv4_voltage", "PV4 Voltage",    0.5,  "V",  "voltage"),
+    "p1":  ("ac_voltage",  "AC Voltage",     1.0,  "V",  "voltage"),
+    "p2":  ("frequency",   "Grid Frequency", 0.01, "Hz", "frequency"),
 }
 PV_POWER_IDS = ("pv1_power", "pv2_power", "pv3_power", "pv4_power")
+
+# Derived sensors (computed, not raw keys): per-string current = power / voltage,
+# plus total power. Published to discovery in addition to SENSORS.
+DERIVED = {
+    "pv1_current": ("PV1 Current", "A", "current"),
+    "pv2_current": ("PV2 Current", "A", "current"),
+    "pv3_current": ("PV3 Current", "A", "current"),
+    "pv4_current": ("PV4 Current", "A", "current"),
+    "total_power": ("Total PV Power", "W", "power"),
+}
+# Sensor ids published by older versions — cleared from discovery on connect.
+REMOVED_SENSOR_IDS = ("dc_voltage",)
 
 states = {}         # serial -> {sensor_id: value}
 discovered = set()  # serials with published discovery
@@ -108,9 +123,11 @@ def publish_discovery(client, serial):
     for _key, (sid, name, _f, unit, dclass) in SENSORS.items():
         client.publish(f"{DISCOVERY_PREFIX}/sensor/rc_mi2s_{serial}/{sid}/config",
                        json.dumps(_sensor_config(serial, sid, name, unit, dclass)), retain=True)
-    client.publish(f"{DISCOVERY_PREFIX}/sensor/rc_mi2s_{serial}/total_power/config",
-                   json.dumps(_sensor_config(serial, "total_power", "Total PV Power", "W", "power")),
-                   retain=True)
+    for sid, (name, unit, dclass) in DERIVED.items():
+        client.publish(f"{DISCOVERY_PREFIX}/sensor/rc_mi2s_{serial}/{sid}/config",
+                       json.dumps(_sensor_config(serial, sid, name, unit, dclass)), retain=True)
+    for sid in REMOVED_SENSOR_IDS:   # delete stale entities from older versions
+        client.publish(f"{DISCOVERY_PREFIX}/sensor/rc_mi2s_{serial}/{sid}/config", "", retain=True)
     client.publish(avail_topic(serial), "online", retain=True)
     print(f"[bridge] published discovery for {serial}", flush=True)
 
@@ -225,6 +242,14 @@ def on_message(client, userdata, msg):
                 pass
     if updated:
         st["total_power"] = round(sum(st.get(s, 0) for s in PV_POWER_IDS), 1)
+        # derive per-string current = power / voltage (matches the app exactly)
+        for n in (1, 2, 3, 4):
+            p = st.get(f"pv{n}_power")
+            v = st.get(f"pv{n}_voltage")
+            if p is not None and v:
+                st[f"pv{n}_current"] = round(p / v, 2)
+            elif p == 0:
+                st[f"pv{n}_current"] = 0.0
         client.publish(state_topic(serial), json.dumps(st))
         print(f"[bridge] {serial} update: {st}", flush=True)
 
