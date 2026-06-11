@@ -59,6 +59,7 @@ SENSORS = {
     "p1":  ("ac_voltage",     "AC Voltage",      1.0,  "V",  "voltage"),
     "p2":  ("frequency",      "Grid Frequency",  0.01, "Hz", "frequency"),
     "p4":  ("temperature",    "Temperature",     1.0,  "°C", "temperature"),
+    "p5":  ("ac_power",       "AC Power",        1.0,  "W",  "power"),
     "p7":  ("signal_strength", "Signal Strength", 1.0,  "%",  None),
 }
 PV_POWER_IDS = ("pv1_power", "pv2_power", "pv3_power", "pv4_power")

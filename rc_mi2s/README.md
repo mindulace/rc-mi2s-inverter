@@ -4,23 +4,53 @@ Local, **cloud-free** bridge for the **RC MI2S-800D** microinverter (sold under
 RC / Rockcore, cloud `rc-ess.com`, app "RC-C", internal MQTT platform
 `jowoiot`). It reads the inverter's MQTT telemetry from your local Mosquitto,
 decodes it and exposes the values as Home Assistant sensors via MQTT discovery —
-**no manufacturer cloud involved**.
+**no manufacturer cloud involved**. Optional forwarding keeps the original app
+working.
+
+> ⚠️ **Unmaintained — no support, no warranty.** Personal reverse-engineering
+> project, shared as-is. Not actively maintained; it may break with firmware or
+> Home Assistant changes. **Use at your own risk.** Forks/PRs welcome, issues may
+> go unanswered.
 
 ## Requirements
 - Home Assistant with the **Mosquitto broker** add-on (your existing one is fine).
-- A way to redirect the inverter to your broker (see below).
+- A way to redirect the inverter to your broker (DNS override + firewall, below).
 
 ## How it works
 The inverter is an MQTT client that publishes to `jowoiot/toServer/v2/<serial>`
 and subscribes to `jowoiot/toEdge/<serial>`. This bridge:
 1. subscribes to the telemetry, decodes the `{"data":[{"k":..,"v":..}]}` JSON and
-   publishes HA-discovery sensors (PV1..PV4 power, total power, AC voltage, grid
-   frequency, DC voltage);
-2. replies on `toEdge` immediately for every message (time sync) — without that
-   prompt reply the inverter keeps reconnecting.
+   publishes HA-discovery sensors;
+2. answers on `toEdge` for **every** message — a content-based handshake the
+   inverter requires (`register` echoing its `g4` value to complete
+   registration, `err` for flag groups, `save` otherwise). Without a prompt
+   reply the inverter stays stuck and keeps reconnecting.
 
 The serial number is **auto-detected** from the topic, so no configuration is
 required for it to work.
+
+## Sensors
+Exposed under the device **"RC MI2S Inverter \<serial\>"**:
+
+| Sensor | Unit | Source |
+|--------|------|--------|
+| PV1–PV4 Power | W | per-string DC power |
+| PV1–PV4 Voltage | V | per-string DC voltage (shared MPPT) |
+| PV1–PV4 Current | A | derived (power ÷ voltage) |
+| Total PV Power | W | sum of strings |
+| AC Power | W | output power (updates every ~15 min) |
+| AC Voltage | V | grid voltage |
+| Grid Frequency | Hz | grid frequency |
+| Temperature | °C | inverter temperature |
+| Signal Strength | % | Wi-Fi signal |
+
+Unused inputs (e.g. PV3/PV4) simply report 0.
+
+### Energy dashboard
+The device's internal energy counter carries a factory offset, so use a
+**Riemann sum integral helper** on *Total PV Power* (metric prefix `k`, time
+unit `h`) to get a clean kWh sensor, then add it under
+*Settings → Dashboards → Energy → Solar production*.
 
 ## Setup
 
@@ -42,17 +72,23 @@ service automatically.
   it drops the cached cloud IP.
 
 ### 3. Start the add-on
-Watch the log for `update: {...}` lines. The sensors appear under the device
-**"RC MI2S Inverter <serial>"**.
+Watch the log for `update: {...}` lines. The sensors appear under the device.
 
 ## Options
 | Option          | Default | Meaning |
 |-----------------|---------|---------|
 | `serial`        | (empty) | Restrict to one device serial. Empty = auto-detect all. |
-| `send_timesync` | `true`  | Send the `toEdge` time-sync reply (recommended; turn off only to debug). |
+| `send_timesync` | `true`  | Send the `toEdge` handshake/time-sync replies. Leave on (turn off only to debug). |
+| `forward_host`  | (empty) | Forward telemetry to the real cloud so the manufacturer app keeps working. Use the cloud **IP** (e.g. `47.237.20.177`), **not** the hostname — your DNS override points the hostname back to the local broker (that would loop). Empty = off. |
+| `forward_port`  | `1883`  | Cloud port for forwarding. |
+
+When forwarding is enabled, the bridge relays both directions and lets the cloud
+answer `toEdge` (local emulation pauses). If the cloud host is unreachable it
+falls back to local emulation. Find the current cloud IP with
+`nslookup www.eur-mq.rc-ess.com` from a device **without** the DNS override.
 
 ## Notes
-- After redirecting, the **manufacturer app stops working** (intended — local only).
-- Key mapping (`pa1`=PV1 W, `pb1`=PV2 W, `p1`=AC V, `p2`=Hz, `g5`=DC V) was derived
-  from a capture. Unmapped fields (`pa2/pb2`, `pa3/pb3`, `p3–p8`, `g1–g4`) are not
-  exposed yet. Contributions welcome.
+- After redirecting, the manufacturer app only works if `forward_host` is set.
+- All telemetry keys were reverse-engineered and verified against the app.
+  Static config/limit groups (`ctrl1_*`) and unused fields (`p3`, `p8`,
+  `g1`–`g6`) are intentionally not exposed.
