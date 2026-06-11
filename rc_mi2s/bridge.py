@@ -56,8 +56,10 @@ SENSORS = {
     "pb2": ("pv2_voltage", "PV2 Voltage",    0.5,  "V",  "voltage"),
     "pc2": ("pv3_voltage", "PV3 Voltage",    0.5,  "V",  "voltage"),
     "pd2": ("pv4_voltage", "PV4 Voltage",    0.5,  "V",  "voltage"),
-    "p1":  ("ac_voltage",  "AC Voltage",     1.0,  "V",  "voltage"),
-    "p2":  ("frequency",   "Grid Frequency", 0.01, "Hz", "frequency"),
+    "p1":  ("ac_voltage",     "AC Voltage",      1.0,  "V",  "voltage"),
+    "p2":  ("frequency",      "Grid Frequency",  0.01, "Hz", "frequency"),
+    "p4":  ("temperature",    "Temperature",     1.0,  "°C", "temperature"),
+    "p7":  ("signal_strength", "Signal Strength", 1.0,  "%",  None),
 }
 PV_POWER_IDS = ("pv1_power", "pv2_power", "pv3_power", "pv4_power")
 
@@ -106,17 +108,19 @@ def device_block(serial):
 
 
 def _sensor_config(serial, sid, name, unit, dclass):
-    return {
+    cfg = {
         "name": name,
         "unique_id": f"rc_mi2s_{serial}_{sid}",
         "state_topic": state_topic(serial),
         "value_template": "{{ value_json.%s }}" % sid,
         "unit_of_measurement": unit,
-        "device_class": dclass,
         "state_class": "measurement",
         "availability_topic": avail_topic(serial),
         "device": device_block(serial),
     }
+    if dclass:                       # signal strength etc. have no device_class
+        cfg["device_class"] = dclass
+    return cfg
 
 
 def publish_discovery(client, serial):
