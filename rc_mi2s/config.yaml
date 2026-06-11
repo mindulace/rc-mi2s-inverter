@@ -1,6 +1,6 @@
 name: RC MI2S Inverter
 slug: rc_mi2s
-version: "1.1.1"
+version: "1.2.0"
 description: Local cloud-free bridge for RC MI2S-800D microinverters to Home Assistant (MQTT discovery)
 url: https://github.com/mindulace/rc-mi2s-inverter
 arch:
@@ -17,6 +17,10 @@ services:
 options:
   serial: ""
   send_timesync: true
+  forward_host: ""
+  forward_port: 1883
 schema:
   serial: "str?"
   send_timesync: bool
+  forward_host: "str?"
+  forward_port: port

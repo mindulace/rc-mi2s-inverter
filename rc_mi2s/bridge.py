@@ -34,6 +34,13 @@ MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD") or None
 SERIAL_FILTER = (os.environ.get("SERIAL") or "").strip()   # empty = all devices
 SEND_TIMESYNC = (os.environ.get("SEND_TIMESYNC", "true").lower() == "true")
 
+# Optional forwarding to the real cloud so the manufacturer app keeps working.
+# Use the cloud's IP (e.g. 47.237.20.177) — NOT the hostname, which your DNS
+# override points back to the local broker (that would loop). Empty = off.
+FORWARD_HOST = (os.environ.get("FORWARD_HOST") or "").strip()
+FORWARD_PORT = int(os.environ.get("FORWARD_PORT", "1883"))
+FORWARDING = bool(FORWARD_HOST)
+
 DISCOVERY_PREFIX = "homeassistant"
 TELEMETRY_WILDCARD = "jowoiot/toServer/v2/+"   # device-fixed namespace
 
@@ -53,6 +60,9 @@ PV_POWER_IDS = ("pv1_power", "pv2_power", "pv3_power", "pv4_power")
 
 states = {}         # serial -> {sensor_id: value}
 discovered = set()  # serials with published discovery
+
+_local_client = None              # set in main(), used to relay cloud -> inverter
+_cloud = {"client": None, "serial": None}   # second connection for forwarding
 
 
 def now_ms():
@@ -136,6 +146,38 @@ def send_response(client, serial, data, device_t):
     print(f"[bridge] {serial} -> toEdge {rtype} value={rval}", flush=True)
 
 
+def _cloud_on_connect(c, userdata, flags, rc):
+    serial = userdata
+    print(f"[forward] connected to cloud {FORWARD_HOST}:{FORWARD_PORT} (rc={rc})", flush=True)
+    c.subscribe(f"jowoiot/toEdge/{serial}")
+
+
+def _cloud_on_message(c, userdata, msg):
+    # cloud -> inverter: relay the cloud's toEdge command to the local broker
+    if _local_client is not None:
+        _local_client.publish(f"jowoiot/toEdge/{userdata}", msg.payload)
+
+
+def ensure_cloud(serial):
+    """Open a second MQTT connection to the real cloud (once) and relay this
+    device both ways, so the manufacturer app keeps working. We rely on the
+    cloud's toEdge replies instead of our local emulation."""
+    if not FORWARDING or _cloud["client"] is not None:
+        return
+    cc = mqtt.Client(client_id=serial, userdata=serial)
+    cc.username_pw_set("client", "client")   # the device's hard-coded cloud login
+    cc.on_connect = _cloud_on_connect
+    cc.on_message = _cloud_on_message
+    try:
+        cc.connect(FORWARD_HOST, FORWARD_PORT, keepalive=60)
+        cc.loop_start()
+        _cloud["client"] = cc
+        _cloud["serial"] = serial
+        print(f"[forward] forwarding {serial} <-> cloud {FORWARD_HOST}:{FORWARD_PORT}", flush=True)
+    except Exception as e:
+        print(f"[forward] cloud connect failed: {e}", flush=True)
+
+
 def on_connect(client, userdata, flags, rc):
     print(f"[bridge] connected to broker (rc={rc}) — subscribing {TELEMETRY_WILDCARD}", flush=True)
     client.subscribe(TELEMETRY_WILDCARD)
@@ -157,8 +199,18 @@ def on_message(client, userdata, msg):
         discovered.add(serial)
 
     data = obj.get("data", [])
-    # reply immediately first (completes registration / keeps stream going)
-    send_response(client, serial, data, obj.get("meta", {}).get("t"))
+    # Either relay to the cloud (so the app works) and let the cloud answer
+    # toEdge, or answer toEdge ourselves locally. Falls back to local if the
+    # cloud connection isn't up yet.
+    forwarded = False
+    if FORWARDING:
+        ensure_cloud(serial)
+        cc = _cloud["client"]
+        if cc is not None and serial == _cloud["serial"]:
+            cc.publish(f"jowoiot/toServer/v2/{serial}", msg.payload)
+            forwarded = True
+    if not forwarded:
+        send_response(client, serial, data, obj.get("meta", {}).get("t"))
 
     st = states.setdefault(serial, {})
     updated = False
@@ -178,13 +230,21 @@ def on_message(client, userdata, msg):
 
 
 def main():
+    global _local_client
     client = mqtt.Client(client_id="rc-mi2s-inverter-bridge")
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
     client.on_connect = on_connect
     client.on_message = on_message
+    _local_client = client
+    fwd = f"{FORWARD_HOST}:{FORWARD_PORT}" if FORWARDING else "off"
     print(f"[bridge] starting — broker {MQTT_HOST}:{MQTT_PORT}, "
-          f"filter={SERIAL_FILTER or 'all devices'}, timesync={SEND_TIMESYNC}", flush=True)
+          f"filter={SERIAL_FILTER or 'all devices'}, timesync={SEND_TIMESYNC}, "
+          f"forward={fwd}", flush=True)
+    # If forwarding to a fixed device, open the cloud link up front so it is
+    # ready to relay the registration group when the inverter (re)connects.
+    if FORWARDING and SERIAL_FILTER:
+        ensure_cloud(SERIAL_FILTER)
     while True:
         try:
             client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
