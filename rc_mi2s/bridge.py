@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+RC MI2S Inverter bridge — RC MI2S-800D (the "jowoiot" platform) -> Home Assistant.
+
+Connects as an MQTT client to the (local) Mosquitto broker, subscribes to the
+inverter telemetry (jowoiot/toServer/v2/<serial>), decodes the key/value JSON
+and exposes the values as Home Assistant sensors via MQTT discovery. The serial
+number is auto-detected from the topic, so it works without configuration for
+any number of devices. The optional `serial` option restricts it to one device.
+
+The bridge also replies on toEdge immediately for every telemetry message
+(time sync). Without that prompt reply the inverter considers the server dead
+and keeps reconnecting.
+
+Note: `jowoiot/...` is the device's fixed topic namespace (baked into the
+firmware, cannot be changed). `rc_mi2s/...` is this bridge's own namespace for
+the decoded/republished state.
+
+Configuration via environment (run.sh fills these from the add-on options):
+    MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASSWORD  (from the HA MQTT service)
+    SERIAL          optional: only accept this device (empty = all)
+    SEND_TIMESYNC   "true" / "false"
+"""
+import json
+import os
+import time
+
+import paho.mqtt.client as mqtt
+
+MQTT_HOST = os.environ.get("MQTT_HOST", "core-mosquitto")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_USER = os.environ.get("MQTT_USER") or None
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD") or None
+SERIAL_FILTER = (os.environ.get("SERIAL") or "").strip()   # empty = all devices
+SEND_TIMESYNC = (os.environ.get("SEND_TIMESYNC", "true").lower() == "true")
+
+DISCOVERY_PREFIX = "homeassistant"
+TELEMETRY_WILDCARD = "jowoiot/toServer/v2/+"   # device-fixed namespace
+
+# Telemetry key -> (sensor_id, friendly name, factor, unit, device_class).
+# Confirmed from a capture: pa1/pb1 = live per-string power (W),
+# p1 = AC voltage, p2 = grid frequency (/100), g5 = DC voltage (/100).
+SENSORS = {
+    "pa1": ("pv1_power",  "PV1 Power",      1.0,  "W",  "power"),
+    "pb1": ("pv2_power",  "PV2 Power",      1.0,  "W",  "power"),
+    "pc1": ("pv3_power",  "PV3 Power",      1.0,  "W",  "power"),
+    "pd1": ("pv4_power",  "PV4 Power",      1.0,  "W",  "power"),
+    "p1":  ("ac_voltage", "AC Voltage",     1.0,  "V",  "voltage"),
+    "p2":  ("frequency",  "Grid Frequency", 0.01, "Hz", "frequency"),
+    "g5":  ("dc_voltage", "DC Voltage",     0.01, "V",  "voltage"),
+}
+PV_POWER_IDS = ("pv1_power", "pv2_power", "pv3_power", "pv4_power")
+
+states = {}         # serial -> {sensor_id: value}
+discovered = set()  # serials with published discovery
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def state_topic(serial):
+    return f"rc_mi2s/{serial}/state"
+
+
+def avail_topic(serial):
+    return f"rc_mi2s/{serial}/availability"
+
+
+def toedge_topic(serial):
+    return f"jowoiot/toEdge/{serial}"   # device-fixed namespace
+
+
+def device_block(serial):
+    return {
+        "identifiers": [f"rc_mi2s_{serial}"],
+        "name": f"RC MI2S Inverter {serial}",
+        "manufacturer": "RC / Rockcore",
+        "model": "MI2S-800D",
+    }
+
+
+def _sensor_config(serial, sid, name, unit, dclass):
+    return {
+        "name": name,
+        "unique_id": f"rc_mi2s_{serial}_{sid}",
+        "state_topic": state_topic(serial),
+        "value_template": "{{ value_json.%s }}" % sid,
+        "unit_of_measurement": unit,
+        "device_class": dclass,
+        "state_class": "measurement",
+        "availability_topic": avail_topic(serial),
+        "device": device_block(serial),
+    }
+
+
+def publish_discovery(client, serial):
+    for _key, (sid, name, _f, unit, dclass) in SENSORS.items():
+        client.publish(f"{DISCOVERY_PREFIX}/sensor/rc_mi2s_{serial}/{sid}/config",
+                       json.dumps(_sensor_config(serial, sid, name, unit, dclass)), retain=True)
+    client.publish(f"{DISCOVERY_PREFIX}/sensor/rc_mi2s_{serial}/total_power/config",
+                   json.dumps(_sensor_config(serial, "total_power", "Total PV Power", "W", "power")),
+                   retain=True)
+    client.publish(avail_topic(serial), "online", retain=True)
+    print(f"[bridge] published discovery for {serial}", flush=True)
+
+
+def serial_from_topic(topic):
+    parts = topic.split("/")
+    return parts[-1] if len(parts) >= 4 and parts[-1] else None
+
+
+def send_ack(client, serial, device_t):
+    """Immediate toEdge reply for every telemetry message (like the cloud does).
+    trecv echoes the device's meta.t (time sync), tsend = our real time."""
+    if not SEND_TIMESYNC:
+        return
+    msg = {"type": "save", "value": "0",
+           "tsend": now_ms(),
+           "trecv": device_t if device_t is not None else now_ms(),
+           "interval": 30}
+    client.publish(toedge_topic(serial), json.dumps(msg))
+
+
+def on_connect(client, userdata, flags, rc):
+    print(f"[bridge] connected to broker (rc={rc}) — subscribing {TELEMETRY_WILDCARD}", flush=True)
+    client.subscribe(TELEMETRY_WILDCARD)
+
+
+def on_message(client, userdata, msg):
+    serial = serial_from_topic(msg.topic)
+    if not serial:
+        return
+    if SERIAL_FILTER and serial != SERIAL_FILTER:
+        return
+    try:
+        obj = json.loads(msg.payload.decode("utf-8", "replace"))
+    except Exception:
+        return
+
+    if serial not in discovered:
+        publish_discovery(client, serial)
+        discovered.add(serial)
+
+    # reply immediately first (keeps the connection stable), then process
+    send_ack(client, serial, obj.get("meta", {}).get("t"))
+
+    st = states.setdefault(serial, {})
+    updated = False
+    for item in obj.get("data", []):
+        k, v = item.get("k"), item.get("v")
+        if k in SENSORS:
+            sid, _n, factor, _u, _d = SENSORS[k]
+            try:
+                st[sid] = round(float(v) * factor, 2)
+                updated = True
+            except (TypeError, ValueError):
+                pass
+    if updated:
+        st["total_power"] = round(sum(st.get(s, 0) for s in PV_POWER_IDS), 1)
+        client.publish(state_topic(serial), json.dumps(st))
+        print(f"[bridge] {serial} update: {st}", flush=True)
+
+
+def main():
+    client = mqtt.Client(client_id="rc-mi2s-inverter-bridge")
+    if MQTT_USER:
+        client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    print(f"[bridge] starting — broker {MQTT_HOST}:{MQTT_PORT}, "
+          f"filter={SERIAL_FILTER or 'all devices'}, timesync={SEND_TIMESYNC}", flush=True)
+    while True:
+        try:
+            client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+            client.loop_forever()
+        except Exception as e:
+            print(f"[bridge] broker connection failed: {e} — retry in 5s", flush=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
