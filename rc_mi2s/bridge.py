@@ -110,16 +110,30 @@ def serial_from_topic(topic):
     return parts[-1] if len(parts) >= 4 and parts[-1] else None
 
 
-def send_ack(client, serial, device_t):
-    """Immediate toEdge reply for every telemetry message (like the cloud does).
-    trecv echoes the device's meta.t (time sync), tsend = our real time."""
+def send_response(client, serial, data, device_t):
+    """Reply on toEdge for every message, mirroring the cloud's handshake.
+
+    This is a request/response protocol: the inverter sends the registration
+    group (g1..g6, contains g4) and stays stuck there until it receives a
+    'register' ack that echoes its g4 value — only then does it stream the data
+    groups. Flag groups (fa3/fb3) expect 'err', everything else 'save'.
+    trecv echoes the device's meta.t (time sync), tsend = our real time.
+    """
     if not SEND_TIMESYNC:
         return
-    msg = {"type": "save", "value": "0",
+    kv = {it.get("k"): it.get("v") for it in data}
+    if "g4" in kv:
+        rtype, rval = "register", kv["g4"]
+    elif "fa3" in kv:
+        rtype, rval = "err", kv["fa3"]
+    else:
+        rtype, rval = "save", "0"
+    msg = {"type": rtype, "value": str(rval),
            "tsend": now_ms(),
            "trecv": device_t if device_t is not None else now_ms(),
            "interval": 30}
     client.publish(toedge_topic(serial), json.dumps(msg))
+    print(f"[bridge] {serial} -> toEdge {rtype} value={rval}", flush=True)
 
 
 def on_connect(client, userdata, flags, rc):
@@ -142,12 +156,13 @@ def on_message(client, userdata, msg):
         publish_discovery(client, serial)
         discovered.add(serial)
 
-    # reply immediately first (keeps the connection stable), then process
-    send_ack(client, serial, obj.get("meta", {}).get("t"))
+    data = obj.get("data", [])
+    # reply immediately first (completes registration / keeps stream going)
+    send_response(client, serial, data, obj.get("meta", {}).get("t"))
 
     st = states.setdefault(serial, {})
     updated = False
-    for item in obj.get("data", []):
+    for item in data:
         k, v = item.get("k"), item.get("v")
         if k in SENSORS:
             sid, _n, factor, _u, _d = SENSORS[k]
